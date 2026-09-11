@@ -17,8 +17,8 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.foodrecommendation.dto.NearbyRestaurantDto;
 import com.foodrecommendation.dto.RecommendedFoodDto;
 import com.foodrecommendation.entity.AIConversation;
@@ -119,7 +119,12 @@ public class AIConversationService {
         List<NearbyRestaurantDto> nearbyRestaurants = findNearbyRestaurants(
                 conversation.getLatitude(), conversation.getLongitude(), userMessage);
         boolean hasLocation = conversation.getLatitude() != null && conversation.getLongitude() != null;
-        String locationContext = buildLocationContext(nearbyRestaurants, hasLocation);
+        // Chỉ đưa ngữ cảnh vị trí (kể cả thông báo "không tìm thấy quán gần
+        // đó") vào prompt khi câu hỏi thật sự có ý hỏi vị trí — nếu không,
+        // 1 câu hỏi không liên quan (vd hỏi ngân sách) sẽ bị chèn nhầm thông
+        // tin "chưa tìm thấy quán gần bạn", làm Gemini trả lời lạc đề.
+        boolean askedAboutLocation = hasLocation && hasNearMeIntent(userMessage);
+        String locationContext = buildLocationContext(nearbyRestaurants, askedAboutLocation);
         String historyContext = buildConversationHistoryContext(conversation.getSessionId());
         GeminiStructuredResult result = callGeminiAPI(userMessage, foodRestaurantContext, locationContext, historyContext);
 
@@ -333,6 +338,13 @@ public class AIConversationService {
         List<String> districtKeywords = extractDistrictKeywords(userMessage);
         boolean hasDistrict = !districtKeywords.isEmpty();
         boolean hasLocation = lat != null && lng != null;
+        // Chỉ dùng nhánh "quán GẦN VỊ TRÍ GPS" khi câu hỏi thật sự có ý hỏi vị
+        // trí (vd "gần tôi", "gần đây") — KHÔNG được tự động kích hoạt chỉ vì
+        // trình duyệt đã có tọa độ. Nếu không, một câu hỏi hoàn toàn không
+        // liên quan tới vị trí (vd "có món nào dưới 50k không") sẽ bị nhánh
+        // này "cướp" mất, trả ra card nhà hàng gần đó thay vì card món ăn có
+        // giá đúng theo yêu cầu.
+        boolean hasNearMeIntent = hasNearMeIntent(userMessage);
 
         List<Restaurant> candidates;
         if (hasDistrict) {
@@ -346,7 +358,7 @@ public class AIConversationService {
                     candidates.add(r);
                 }
             }
-        } else if (hasLocation) {
+        } else if (hasLocation && hasNearMeIntent) {
             candidates = restaurantRepository.findByDistance(lat, lng, NEARBY_RADIUS_KM);
         } else {
             return Collections.emptyList();
@@ -435,6 +447,22 @@ public class AIConversationService {
                 matched = addr.contains(districtKeyword);
             }
             if (matched) return true;
+        }
+        return false;
+    }
+
+    // Các cụm từ cho thấy người dùng thật sự đang hỏi về VỊ TRÍ/khoảng cách
+    // (không phải chỉ vì trình duyệt tình cờ đã có tọa độ GPS).
+    private static final List<String> NEAR_ME_KEYWORDS = Arrays.asList(
+            "gần", "gan day", "gần đây", "gần tôi", "gần nhà", "gần chỗ", "gần vị trí",
+            "xung quanh", "khoảng cách", "cách đây", "gần nhất", "lân cận"
+    );
+
+    private boolean hasNearMeIntent(String userMessage) {
+        if (userMessage == null) return false;
+        String msg = userMessage.toLowerCase();
+        for (String kw : NEAR_ME_KEYWORDS) {
+            if (msg.contains(kw)) return true;
         }
         return false;
     }
@@ -722,8 +750,13 @@ public class AIConversationService {
             "danh sách quán cụ thể đã được hệ thống tính toán sẵn và sẽ hiển thị dạng card; nếu KHÔNG có " +
             "mục đó, hãy nói rõ trong replyText là chưa nhận được vị trí của người dùng (trình duyệt chưa " +
             "cấp quyền định vị) thay vì bịa khoảng cách.\n" +
-            "Nếu có LỊCH SỬ HỘI THOẠI bên dưới, hãy dùng nó để hiểu ngữ cảnh câu hỏi hiện tại " +
-            "(ví dụ người dùng nói \"còn món khác thì sao\" nghĩa là tiếp nối câu hỏi trước đó).\n" +
+            "Nếu có LỊCH SỬ HỘI THOẠI bên dưới, CHỈ dùng nó khi câu hỏi hiện tại thật sự phụ thuộc vào " +
+            "câu trước đó để hiểu được (vd dùng đại từ/nói tắt như \"còn món khác thì sao\", \"cái đó giá " +
+            "bao nhiêu\", \"vậy còn gần đây thì sao\"). " +
+            "Nếu câu hỏi hiện tại đã tự đầy đủ nghĩa và KHÔNG liên quan gì tới lịch sử (vd chào hỏi, hỏi " +
+            "\"bạn là ai\", hỏi ngoài chủ đề ẩm thực, hoặc đơn giản là 1 câu hỏi độc lập mới), hãy trả lời " +
+            "ĐÚNG câu hỏi hiện tại, TUYỆT ĐỐI KHÔNG lặp lại hay áp nội dung của câu hỏi/câu trả lời trước " +
+            "đó vào — lịch sử chỉ để tham khảo ngữ cảnh, không phải để trả lời thay câu hỏi mới.\n" +
             "Người dùng đang ở Việt Nam.\n" +
             "Hãy trả lời bằng tiếng Việt nếu người dùng hỏi tiếng Việt, tiếng Anh nếu hỏi tiếng Anh " +
             "(replyText viết theo ngôn ngữ đó).\n\n" +
