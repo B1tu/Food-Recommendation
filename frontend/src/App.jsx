@@ -501,6 +501,7 @@ function App() {
         role: 'ai',
         content: data.aiResponse || 'Xin lỗi, hệ thống chưa phản hồi.',
         nearbyRestaurants: data.nearbyRestaurants || [],
+        recommendedFoods: data.recommendedFoods || [],
       }])
       setActiveChat(sessionId)
       loadSessions()
@@ -941,6 +942,32 @@ function App() {
                           >
                             🗺️
                           </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {(!msg.nearbyRestaurants || msg.nearbyRestaurants.length === 0) &&
+                    msg.recommendedFoods && msg.recommendedFoods.length > 0 && (
+                    <div className="food-cards">
+                      {msg.recommendedFoods.map((f, i) => (
+                        <div key={i} className="food-card">
+                          <div className="food-card-main">
+                            <div className="food-card-name">🍽️ {f.name}</div>
+                            <div className="food-card-meta">
+                              <span className="food-card-price">
+                                {f.price != null ? `${Math.round(f.price).toLocaleString(lang === 'vie' ? 'vi-VN' : 'en-US')}đ` : ''}
+                              </span>
+                            </div>
+                            {f.restaurantName && (
+                              <div className="food-card-restaurant">🏠 {f.restaurantName}</div>
+                            )}
+                            {f.restaurantAddress && (
+                              <div className="food-card-address">{f.restaurantAddress}</div>
+                            )}
+                            {f.openingHours && (
+                              <div className="food-card-hours">🕐 {f.openingHours}</div>
+                            )}
+                          </div>
                         </div>
                       ))}
                     </div>

@@ -3,6 +3,9 @@ package com.foodrecommendation.entity;
 import java.time.LocalDateTime;
 import java.util.List;
 
+import com.foodrecommendation.dto.NearbyRestaurantDto;
+import com.foodrecommendation.dto.RecommendedFoodDto;
+
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.GeneratedValue;
@@ -10,8 +13,6 @@ import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
 import jakarta.persistence.Table;
 import jakarta.persistence.Transient;
-
-import com.foodrecommendation.dto.NearbyRestaurantDto;
 
 @Entity
 @Table(name = "AI_CONVERSATION")
@@ -55,6 +56,12 @@ public class AIConversation {
     // aiResponse để frontend hiển thị dạng thẻ (card), không lưu DB.
     @Transient
     private List<NearbyRestaurantDto> nearbyRestaurants;
+
+    // Danh sách món ăn được gợi ý (không gắn với tìm-quán-gần-vị-trí) — do
+    // Gemini chọn ID (structured output), backend đối chiếu với dữ liệu thật
+    // để dựng card, không lưu DB. Chỉ dùng khi nearbyRestaurants rỗng.
+    @Transient
+    private List<RecommendedFoodDto> recommendedFoods;
 
     public AIConversation() {
     }
@@ -138,5 +145,13 @@ public class AIConversation {
 
     public void setNearbyRestaurants(List<NearbyRestaurantDto> nearbyRestaurants) {
         this.nearbyRestaurants = nearbyRestaurants;
+    }
+
+    public List<RecommendedFoodDto> getRecommendedFoods() {
+        return recommendedFoods;
+    }
+
+    public void setRecommendedFoods(List<RecommendedFoodDto> recommendedFoods) {
+        this.recommendedFoods = recommendedFoods;
     }
 }

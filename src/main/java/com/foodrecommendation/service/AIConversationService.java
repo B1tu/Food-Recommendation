@@ -18,7 +18,9 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.foodrecommendation.dto.NearbyRestaurantDto;
+import com.foodrecommendation.dto.RecommendedFoodDto;
 import com.foodrecommendation.entity.AIConversation;
 import com.foodrecommendation.entity.Food;
 import com.foodrecommendation.entity.History;
@@ -110,25 +112,65 @@ public class AIConversationService {
             userMessage = userMessage.substring(0, MAX_USER_MESSAGE_LENGTH);
         }
 
-        String foodRestaurantContext = buildFoodRestaurantContext(conversation.getUserId());
+        Map<Integer, Food> foodContextIndex = new HashMap<>();
+        Map<Integer, Restaurant> restaurantContextIndex = new HashMap<>();
+        String foodRestaurantContext = buildFoodRestaurantContext(
+                conversation.getUserId(), foodContextIndex, restaurantContextIndex);
         List<NearbyRestaurantDto> nearbyRestaurants = findNearbyRestaurants(
                 conversation.getLatitude(), conversation.getLongitude(), userMessage);
         boolean hasLocation = conversation.getLatitude() != null && conversation.getLongitude() != null;
         String locationContext = buildLocationContext(nearbyRestaurants, hasLocation);
         String historyContext = buildConversationHistoryContext(conversation.getSessionId());
-        String aiResponse = callGeminiAPI(userMessage, foodRestaurantContext, locationContext, historyContext);
+        GeminiStructuredResult result = callGeminiAPI(userMessage, foodRestaurantContext, locationContext, historyContext);
 
         conversation.setUserMessage(userMessage);
-        conversation.setAiResponse(aiResponse);
+        conversation.setAiResponse(result.replyText);
         conversation.setNearbyRestaurants(nearbyRestaurants);
+
+        // Card món ăn chỉ dùng để LẤP chỗ trống khi nhánh quận/vị trí
+        // (nearbyRestaurants) rỗng — không trộn 2 nguồn card cùng lúc.
+        if (nearbyRestaurants == null || nearbyRestaurants.isEmpty()) {
+            List<RecommendedFoodDto> recommendedFoods = buildRecommendedFoods(
+                    result.recommendedFoodIds, foodContextIndex);
+            conversation.setRecommendedFoods(recommendedFoods);
+        } else {
+            conversation.setRecommendedFoods(Collections.emptyList());
+        }
+
         return aiConversationRepository.save(conversation);
+    }
+
+    // Đối chiếu các foodId Gemini chọn (trong JSON có cấu trúc trả về) với
+    // đúng những món đã thực sự đưa vào context — bỏ qua ID lạ/không có
+    // thật, tuyệt đối không tự dựng dữ liệu theo tên AI viết ra.
+    private List<RecommendedFoodDto> buildRecommendedFoods(List<Integer> foodIds, Map<Integer, Food> foodContextIndex) {
+        List<RecommendedFoodDto> result = new ArrayList<>();
+        if (foodIds == null || foodIds.isEmpty()) return result;
+        for (Integer foodId : foodIds) {
+            Food food = foodContextIndex.get(foodId);
+            if (food == null) continue; // ID không có trong danh sách đã đưa cho Gemini -> bỏ qua
+            RestaurantFood rf = findAvailableRestaurantFood(food.getFoodId());
+            Double price = rf != null && rf.getPrice() != null ? rf.getPrice() : food.getPrice();
+            Restaurant restaurant = rf != null ? restaurantRepository.findById(rf.getRestaurantId()).orElse(null) : null;
+            result.add(new RecommendedFoodDto(
+                    food.getFoodId(),
+                    food.getName(),
+                    price,
+                    restaurant != null ? restaurant.getName() : null,
+                    restaurant != null ? restaurant.getAddress() : null,
+                    restaurant != null ? restaurant.getOpeningHours() : null
+            ));
+            if (result.size() >= MAX_RESTAURANTS_IN_CONTEXT) break;
+        }
+        return result;
     }
 
     // =========================================================
     // Ngữ cảnh món ăn / nhà hàng - có dùng RecommendationEngine
     // =========================================================
 
-    private String buildFoodRestaurantContext(Integer userId) {
+    private String buildFoodRestaurantContext(
+            Integer userId, Map<Integer, Food> foodContextIndex, Map<Integer, Restaurant> restaurantContextIndex) {
         List<Food> allFoods = foodRepository.findAll();
         List<Food> selectedFoods;
 
@@ -180,11 +222,13 @@ public class AIConversationService {
         if (!selectedFoods.isEmpty()) {
             context.append("DANH SÁCH MÓN ĂN GỢI Ý (đã chọn lọc phù hợp với người dùng):\n");
             for (Food food : selectedFoods) {
+                foodContextIndex.put(food.getFoodId(), food);
                 RestaurantFood rf = findAvailableRestaurantFood(food.getFoodId());
                 Double price = rf != null && rf.getPrice() != null ? rf.getPrice() : food.getPrice();
                 Restaurant restaurant = rf != null ? restaurantRepository.findById(rf.getRestaurantId()).orElse(null) : null;
 
-                context.append(String.format("- %s | giá: %.0f VND | loại: %s",
+                context.append(String.format("- [F%d] %s | giá: %.0f VND | loại: %s",
+                        food.getFoodId(),
                         food.getName(),
                         price != null ? price : 0,
                         food.getCuisineType() != null ? food.getCuisineType() : "không rõ"));
@@ -211,7 +255,9 @@ public class AIConversationService {
             int count = 0;
             for (Restaurant r : topRestaurants) {
                 if (count >= MAX_RESTAURANTS_IN_CONTEXT) break;
-                context.append(String.format("- %s | rating: %.1f sao | địa chỉ: %s | giờ mở: %s\n",
+                restaurantContextIndex.put(r.getRestaurantId(), r);
+                context.append(String.format("- [R%d] %s | rating: %.1f sao | địa chỉ: %s | giờ mở: %s\n",
+                        r.getRestaurantId(),
                         r.getName(),
                         r.getRating() != null ? r.getRating() : 0.0,
                         r.getAddress() != null ? r.getAddress() : "chưa có",
@@ -282,23 +328,43 @@ public class AIConversationService {
     );
 
     private List<NearbyRestaurantDto> findNearbyRestaurants(Double lat, Double lng, String userMessage) {
-        if (lat == null || lng == null) {
+        List<Food> allFoods = foodRepository.findAll();
+        String dishKeyword = extractDishKeyword(userMessage, allFoods);
+        List<String> districtKeywords = extractDistrictKeywords(userMessage);
+        boolean hasDistrict = !districtKeywords.isEmpty();
+        boolean hasLocation = lat != null && lng != null;
+
+        List<Restaurant> candidates;
+        if (hasDistrict) {
+            // Người dùng nêu rõ (một hoặc nhiều) quận/khu vực (vd "quận 1 hoặc
+            // quận 3") -> lấy nhà hàng khớp BẤT KỲ quận nào trong danh sách,
+            // KHÔNG giới hạn theo khoảng cách GPS (họ hỏi theo địa danh cụ thể,
+            // không phải "gần tôi" — kể cả khi chưa cấp quyền định vị).
+            candidates = new ArrayList<>();
+            for (Restaurant r : restaurantRepository.findAll()) {
+                if (r.getAddress() != null && addressMatchesAnyDistrict(r.getAddress(), districtKeywords)) {
+                    candidates.add(r);
+                }
+            }
+        } else if (hasLocation) {
+            candidates = restaurantRepository.findByDistance(lat, lng, NEARBY_RADIUS_KM);
+        } else {
             return Collections.emptyList();
         }
 
-        List<Restaurant> candidates = restaurantRepository.findByDistance(lat, lng, NEARBY_RADIUS_KM);
         if (candidates == null || candidates.isEmpty()) {
             return Collections.emptyList();
         }
 
-        List<Food> allFoods = foodRepository.findAll();
-        String dishKeyword = extractDishKeyword(userMessage, allFoods);
-
         List<NearbyRestaurantDto> result = new ArrayList<>();
         for (Restaurant r : candidates) {
-            if (r.getLatitude() == null || r.getLongitude() == null) continue;
-            double distanceKm = haversineKm(lat, lng, r.getLatitude(), r.getLongitude());
-            if (distanceKm > NEARBY_RADIUS_KM) continue; // findByDistance dùng bounding box, lọc lại cho chính xác
+            Double distanceKm = null;
+            if (hasLocation && r.getLatitude() != null && r.getLongitude() != null) {
+                distanceKm = haversineKm(lat, lng, r.getLatitude(), r.getLongitude());
+                // Chỉ áp dụng giới hạn bán kính khi KHÔNG có tên quận cụ thể
+                // (đã lọc theo địa chỉ rồi thì không cần giới hạn khoảng cách nữa).
+                if (!hasDistrict && distanceKm > NEARBY_RADIUS_KM) continue;
+            }
 
             // Người dùng hỏi 1 món cụ thể (vd "cơm tấm gần đây") -> chỉ giữ
             // nhà hàng thật sự có bán món đó, tránh trả về lạc đề như trước.
@@ -310,16 +376,67 @@ public class AIConversationService {
                     r.getRestaurantId(),
                     r.getName(),
                     r.getRating(),
-                    Math.round(distanceKm * 10.0) / 10.0,
+                    distanceKm != null ? Math.round(distanceKm * 10.0) / 10.0 : null,
                     r.getAddress(),
                     r.getOpeningHours()
             ));
         }
-        result.sort(Comparator.comparingDouble(NearbyRestaurantDto::getDistanceKm));
+
+        if (hasLocation) {
+            result.sort(Comparator.comparing(
+                    NearbyRestaurantDto::getDistanceKm,
+                    Comparator.nullsLast(Comparator.naturalOrder())));
+        } else {
+            result.sort(Comparator.comparing(
+                    (NearbyRestaurantDto dto) -> dto.getRating() != null ? dto.getRating() : 0.0)
+                    .reversed());
+        }
         if (result.size() > MAX_RESTAURANTS_IN_CONTEXT) {
             return result.subList(0, MAX_RESTAURANTS_IN_CONTEXT);
         }
         return result;
+    }
+
+    // Tìm TẤT CẢ cụm từ chỉ quận/khu vực trong câu hỏi (vd "quận 1 hoặc quận
+    // 3" -> ["quận 1", "quận 3"]), không chỉ quận đầu tiên như trước.
+    private List<String> extractDistrictKeywords(String userMessage) {
+        List<String> found = new ArrayList<>();
+        if (userMessage == null) return found;
+        String msg = userMessage.toLowerCase();
+
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("quận\\s*(\\d{1,2})\\b").matcher(msg);
+        while (m.find()) {
+            String d = "quận " + m.group(1);
+            if (!found.contains(d)) found.add(d);
+        }
+
+        String[] namedDistricts = {
+                "phú nhuận", "bình thạnh", "tân bình", "tân phú", "gò vấp",
+                "thủ đức", "bình tân", "nhà bè", "hóc môn", "củ chi", "bình chánh", "cần giờ"
+        };
+        for (String d : namedDistricts) {
+            if (msg.contains(d) && !found.contains(d)) found.add(d);
+        }
+        return found;
+    }
+
+    // So khớp địa chỉ nhà hàng với BẤT KỲ quận/khu vực nào trong danh sách
+    // được hỏi. Với quận đánh số, tránh "quận 1" khớp nhầm vào "quận
+    // 10"/"quận 11"/"quận 12".
+    private boolean addressMatchesAnyDistrict(String address, List<String> districtKeywords) {
+        String addr = address.toLowerCase();
+        for (String districtKeyword : districtKeywords) {
+            java.util.regex.Matcher numMatch = java.util.regex.Pattern.compile("^quận\\s*(\\d{1,2})$").matcher(districtKeyword);
+            boolean matched;
+            if (numMatch.matches()) {
+                String num = numMatch.group(1);
+                matched = java.util.regex.Pattern.compile("quận\\s*" + num + "(?=[,.]|$)").matcher(addr).find();
+            } else {
+                matched = addr.contains(districtKeyword);
+            }
+            if (matched) return true;
+        }
+        return false;
     }
 
     // Công thức Haversine — tính khoảng cách thực tế (km) giữa 2 tọa độ,
@@ -398,12 +515,14 @@ public class AIConversationService {
         }
 
         StringBuilder sb = new StringBuilder();
-        sb.append("NHÀ HÀNG GẦN VỊ TRÍ NGƯỜI DÙNG (trong bán kính ")
-          .append((int) NEARBY_RADIUS_KM).append("km):\n");
+        sb.append("NHÀ HÀNG PHÙ HỢP VỚI YÊU CẦU VỀ VỊ TRÍ:\n");
         for (NearbyRestaurantDto r : nearbyRestaurants) {
-            sb.append(String.format("- %s | cách %.1f km | rating: %.1f sao | địa chỉ: %s | giờ mở: %s\n",
+            String distancePart = r.getDistanceKm() != null
+                    ? String.format("cách %.1f km", r.getDistanceKm())
+                    : "khoảng cách chưa xác định";
+            sb.append(String.format("- %s | %s | rating: %.1f sao | địa chỉ: %s | giờ mở: %s\n",
                     r.getName(),
-                    r.getDistanceKm(),
+                    distancePart,
                     r.getRating() != null ? r.getRating() : 0.0,
                     r.getAddress() != null ? r.getAddress() : "chưa có",
                     r.getOpeningHours() != null ? r.getOpeningHours() : "chưa có"));
@@ -450,7 +569,20 @@ public class AIConversationService {
     // Gọi Gemini API
     // =========================================================
 
-    private String callGeminiAPI(String userMessage, String foodRestaurantContext, String locationContext, String historyContext) {
+    // Schema JSON bắt buộc Gemini phải trả về (structured output) — thay vì
+    // để AI tự viết văn bản thường, ép nó trả đúng 3 trường để backend dựng
+    // card món ăn/nhà hàng chính xác, không cần đoán từ câu chữ tự do.
+    private static final Map<String, Object> GEMINI_RESPONSE_SCHEMA = Map.of(
+            "type", "OBJECT",
+            "properties", Map.of(
+                    "replyText", Map.of("type", "STRING"),
+                    "recommendedFoodIds", Map.of("type", "ARRAY", "items", Map.of("type", "INTEGER")),
+                    "recommendedRestaurantIds", Map.of("type", "ARRAY", "items", Map.of("type", "INTEGER"))
+            ),
+            "required", List.of("replyText")
+    );
+
+    private GeminiStructuredResult callGeminiAPI(String userMessage, String foodRestaurantContext, String locationContext, String historyContext) {
         try {
             String url = geminiBaseUrl + "?key=" + geminiApiKey;
             String prompt = buildPrompt(userMessage, foodRestaurantContext, locationContext, historyContext);
@@ -458,7 +590,14 @@ public class AIConversationService {
             Map<String, Object> content = Map.of(
                 "parts", new Object[]{ Map.of("text", prompt) }
             );
-            Map<String, Object> requestBody = Map.of("contents", new Object[]{ content });
+            Map<String, Object> generationConfig = Map.of(
+                "responseMimeType", "application/json",
+                "responseSchema", GEMINI_RESPONSE_SCHEMA
+            );
+            Map<String, Object> requestBody = Map.of(
+                "contents", new Object[]{ content },
+                "generationConfig", generationConfig
+            );
 
             HttpHeaders headers = new HttpHeaders();
             headers.setContentType(MediaType.APPLICATION_JSON);
@@ -467,6 +606,7 @@ public class AIConversationService {
             ResponseEntity<Map> response = restTemplate.postForEntity(url, request, Map.class);
             Map<String, Object> responseBody = response.getBody();
 
+            String rawText = null;
             if (responseBody != null && responseBody.containsKey("candidates")) {
                 @SuppressWarnings("unchecked")
                 List<Map<String, Object>> candidates = (List<Map<String, Object>>) responseBody.get("candidates");
@@ -479,43 +619,118 @@ public class AIConversationService {
                             @SuppressWarnings("unchecked")
                             List<Map<String, Object>> parts = (List<Map<String, Object>>) contentItem.get("parts");
                             if (parts != null && !parts.isEmpty()) {
-                                return (String) parts.get(0).get("text");
+                                rawText = (String) parts.get(0).get("text");
                             }
                         }
                     }
                 }
             }
 
-            return "Xin lỗi, tôi không thể trả lời câu hỏi này.";
+            if (rawText == null) {
+                return new GeminiStructuredResult("Xin lỗi, tôi không thể trả lời câu hỏi này.",
+                        Collections.emptyList(), Collections.emptyList());
+            }
 
+            return parseStructuredReply(rawText);
+
+        } catch (org.springframework.web.client.HttpClientErrorException.TooManyRequests e) {
+            // Hết quota Gemini API (thường là gói free 20 request/ngày) — thông báo
+            // rõ ràng hơn cho người dùng thay vì lỗi hệ thống chung chung.
+            System.err.println("Gemini API rate limit/quota exceeded: " + e.getMessage());
+            return new GeminiStructuredResult(
+                    "Hiện tại hệ thống đang có quá nhiều yêu cầu (đã đạt giới hạn API), " +
+                            "vui lòng thử lại sau ít phút.",
+                    Collections.emptyList(), Collections.emptyList());
         } catch (Exception e) {
             System.err.println("Error calling Gemini API: " + e.getMessage());
             e.printStackTrace();
-            return "Xin lỗi, hệ thống đang gặp sự cố.";
+            return new GeminiStructuredResult("Xin lỗi, hệ thống đang gặp sự cố.",
+                    Collections.emptyList(), Collections.emptyList());
+        }
+    }
+
+    // Parse JSON Gemini trả về (đúng theo GEMINI_RESPONSE_SCHEMA). Nếu vì lý
+    // do nào đó JSON không hợp lệ hoặc thiếu field (không nên xảy ra vì đã
+    // ép responseSchema, nhưng vẫn phòng hờ) -> fallback: coi nguyên văn bản
+    // thô là replyText, 2 danh sách ID rỗng — KHÔNG để lỗi parse làm mất
+    // phản hồi hay crash request.
+    private GeminiStructuredResult parseStructuredReply(String rawText) {
+        try {
+            JsonNode node = objectMapper.readTree(rawText);
+            String replyText = node.hasNonNull("replyText") ? node.get("replyText").asText() : rawText;
+            List<Integer> foodIds = new ArrayList<>();
+            if (node.has("recommendedFoodIds") && node.get("recommendedFoodIds").isArray()) {
+                for (JsonNode idNode : node.get("recommendedFoodIds")) {
+                    if (idNode.isInt()) foodIds.add(idNode.asInt());
+                }
+            }
+            List<Integer> restaurantIds = new ArrayList<>();
+            if (node.has("recommendedRestaurantIds") && node.get("recommendedRestaurantIds").isArray()) {
+                for (JsonNode idNode : node.get("recommendedRestaurantIds")) {
+                    if (idNode.isInt()) restaurantIds.add(idNode.asInt());
+                }
+            }
+            return new GeminiStructuredResult(replyText, foodIds, restaurantIds);
+        } catch (Exception e) {
+            System.err.println("Không parse được JSON Gemini trả về, dùng nguyên văn bản: " + e.getMessage());
+            return new GeminiStructuredResult(rawText, Collections.emptyList(), Collections.emptyList());
+        }
+    }
+
+    private static class GeminiStructuredResult {
+        final String replyText;
+        final List<Integer> recommendedFoodIds;
+        final List<Integer> recommendedRestaurantIds;
+
+        GeminiStructuredResult(String replyText, List<Integer> recommendedFoodIds, List<Integer> recommendedRestaurantIds) {
+            this.replyText = replyText;
+            this.recommendedFoodIds = recommendedFoodIds;
+            this.recommendedRestaurantIds = recommendedRestaurantIds;
         }
     }
 
     private String buildPrompt(String userMessage, String foodRestaurantContext, String locationContext, String historyContext) {
         String systemInstruction =
             "Bạn là FoodAI – trợ lý ẩm thực thông minh.\n" +
-            "Hãy trả lời NGẮN GỌN, súc tích, không đoạn văn dài.\n" +
-            "Mỗi gợi ý chỉ 1-2 dòng, có icon, tên món, giá, nhà hàng, địa chỉ, giờ mở.\n" +
-            "CHỈ đưa thông tin về ngân sách, calo, chế độ ăn KHI NGƯỜI DÙNG HỎI CỤ THỂ.\n" +
-            "KHÔNG TỰ Ý THÊM thông tin không được hỏi (ví dụ: ngân sách, sở thích, dietary preferences).\n" +
+            "Bạn PHẢI trả lời đúng theo schema JSON đã cho (responseSchema), gồm 3 trường: " +
+            "replyText, recommendedFoodIds, recommendedRestaurantIds. KHÔNG trả về văn bản tự do " +
+            "ngoài JSON này.\n\n" +
+            "replyText: MỘT CÂU DẪN NGẮN GỌN (1 câu, không liệt kê chi tiết món/giá/địa chỉ trong " +
+            "câu này vì phần chi tiết sẽ hiển thị riêng dưới dạng thẻ/card). Ví dụ: " +
+            "\"Dưới đây là vài món phù hợp cho bạn:\" hoặc \"Mình chưa tìm thấy món nào phù hợp trong " +
+            "danh sách hiện có, bạn thử hỏi khác xem sao nhé.\" nếu không có gợi ý nào phù hợp. " +
+            "Nếu câu hỏi của người dùng KHÔNG liên quan tới việc gợi ý món ăn/nhà hàng (chào hỏi, " +
+            "hỏi han chung chung, hỏi về ngân sách/calo/chế độ ăn của một món đã nhắc trước đó, v.v.) " +
+            "thì trả lời bình thường trong replyText và để 2 danh sách ID rỗng.\n\n" +
+            "recommendedFoodIds: danh sách các ID món ăn (số nguyên, lấy từ tiền tố [F<id>] đứng " +
+            "trước mỗi món trong DANH SÁCH DỮ LIỆU bên dưới) mà bạn thực sự muốn gợi ý cho câu hỏi " +
+            "này. recommendedRestaurantIds: tương tự nhưng lấy từ tiền tố [R<id>] đứng trước mỗi " +
+            "nhà hàng. CHỈ dùng ID CÓ THẬT xuất hiện trong danh sách dữ liệu — TUYỆT ĐỐI KHÔNG bịa " +
+            "ID. Nếu không có món/nhà hàng nào phù hợp, để danh sách rỗng ([]), đừng cố nhét ID " +
+            "không liên quan.\n" +
+            "Không cần điền cả 2 danh sách cùng lúc — nếu câu hỏi chỉ về món ăn nói chung (không " +
+            "gắn với một nhà hàng/vị trí cụ thể) thì chỉ cần recommendedFoodIds; nếu câu hỏi về " +
+            "nhà hàng gần vị trí thì đã có mục VỊ TRÍ NGƯỜI DÙNG/NHÀ HÀNG GẦN VỊ TRÍ riêng xử lý " +
+            "việc đó rồi (mục đó dùng dữ liệu tính toán chính xác, không cần bạn lặp lại ID nhà hàng " +
+            "trong trường hợp này, để recommendedRestaurantIds rỗng).\n\n" +
             "CHỈ được gợi ý món ăn/nhà hàng CÓ TRONG danh sách dữ liệu bên dưới. " +
             "TUYỆT ĐỐI KHÔNG bịa ra món ăn, nhà hàng, giá cả không có trong danh sách.\n" +
-            "Nếu danh sách không có món nào phù hợp với câu hỏi, hãy nói thật là chưa tìm thấy, " +
-            "đừng tự nghĩ ra thông tin.\n" +
+            "CHỈ đưa thông tin về ngân sách, calo, chế độ ăn KHI NGƯỜI DÙNG HỎI CỤ THỂ, và đưa vào " +
+            "replyText dưới dạng câu văn (không có card riêng cho việc này).\n" +
             "Nếu người dùng hỏi về nhà hàng/món ăn GẦN HỌ: nếu có mục VỊ TRÍ NGƯỜI DÙNG/NHÀ HÀNG GẦN VỊ TRÍ " +
-            "bên dưới thì dùng đúng danh sách đó để trả lời; nếu KHÔNG có mục đó, hãy nói rõ là chưa nhận " +
-            "được vị trí của người dùng (trình duyệt chưa cấp quyền định vị) thay vì bịa khoảng cách.\n" +
+            "bên dưới thì replyText chỉ cần 1 câu dẫn ngắn (vd \"Dưới đây là danh sách quán gần bạn nhất:\"), " +
+            "danh sách quán cụ thể đã được hệ thống tính toán sẵn và sẽ hiển thị dạng card; nếu KHÔNG có " +
+            "mục đó, hãy nói rõ trong replyText là chưa nhận được vị trí của người dùng (trình duyệt chưa " +
+            "cấp quyền định vị) thay vì bịa khoảng cách.\n" +
             "Nếu có LỊCH SỬ HỘI THOẠI bên dưới, hãy dùng nó để hiểu ngữ cảnh câu hỏi hiện tại " +
             "(ví dụ người dùng nói \"còn món khác thì sao\" nghĩa là tiếp nối câu hỏi trước đó).\n" +
             "Người dùng đang ở Việt Nam.\n" +
-            "Hãy trả lời bằng tiếng Việt nếu người dùng hỏi tiếng Việt, tiếng Anh nếu hỏi tiếng Anh.\n\n" +
+            "Hãy trả lời bằng tiếng Việt nếu người dùng hỏi tiếng Việt, tiếng Anh nếu hỏi tiếng Anh " +
+            "(replyText viết theo ngôn ngữ đó).\n\n" +
             historyContext +
             locationContext +
-            "DANH SÁCH DỮ LIỆU CÓ SẴN:\n" +
+            "DANH SÁCH DỮ LIỆU CÓ SẴN (mỗi món/nhà hàng có tiền tố [F<id>]/[R<id>] — dùng đúng số " +
+            "id này khi điền recommendedFoodIds/recommendedRestaurantIds):\n" +
             foodRestaurantContext +
             "\nCÂU HỎI CỦA NGƯỜI DÙNG:\n" + userMessage;
 
